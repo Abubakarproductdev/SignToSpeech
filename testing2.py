@@ -1,18 +1,3 @@
-# ============================================================================
-# STEP 5: TEST MODEL (v3 — Webcam + Mobile)
-# PSL Translator - Final Year Project
-#
-# Tests the trained model with LIVE webcam.
-# Same as your working v2 test script.
-#
-# USAGE:
-#   1. Run this script
-#   2. Sign any word in front of webcam
-#   3. See real-time predictions on screen
-#   4. Press Q to quit
-#
-# OUTPUT: Live prediction overlay on webcam feed
-# ============================================================================
 
 import cv2
 import numpy as np
