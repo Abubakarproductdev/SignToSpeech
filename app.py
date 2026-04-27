@@ -14,12 +14,15 @@ from flask_cors import CORS
 import cv2
 import numpy as np
 import mediapipe as mp
+import tensorflow as tf
 from tensorflow import keras
 import json
 import os
 import tempfile
 from collections import deque
 import re
+import threading
+import time
 
 app = Flask(__name__)
 CORS(app) # Enable CORS for mobile access
@@ -89,18 +92,134 @@ VALID_SENTENCES = [
 # CONFIG
 # ============================================================================
 MODEL_PATH = "psl_model_v3.h5"
+TFLITE_MODEL_PATH = "psl_model_v3.tflite"
 CLASS_FILE = "class_names_v3.json"
+DATASET_SAMPLES_PATH = "preprocessed_dataset_v3.npz"
 SEQUENCE_LENGTH = 30
 CONFIDENCE_THRESHOLD = 0.70
+HIGH_FPS_THRESHOLD = 24.0
+HIGH_FPS_PREDICTION_STRIDE = 2
+LOW_FPS_PREDICTION_STRIDE = 1
+TRAILING_NO_HAND_SECONDS = 0.75
+TFLITE_CONFIDENCE_DELTA_TOLERANCE = 0.05
+TFLITE_VALIDATION_SAMPLE_LIMIT = 3
+ZERO_FRAME = np.zeros(144, dtype=np.float32)
+WARMUP_SEQUENCE = np.zeros((1, SEQUENCE_LENGTH, 144), dtype=np.float32)
 
 # ============================================================================
 # LOAD AI ENGINE
 # ============================================================================
-model = keras.models.load_model(MODEL_PATH)
 with open(CLASS_FILE, "r") as f:
     class_names = json.load(f)
 
 mp_holistic = mp.solutions.holistic
+
+
+class PredictionEngine:
+    def __init__(self, keras_model_path, tflite_model_path, validation_dataset_path):
+        self.keras_model = keras.models.load_model(keras_model_path)
+        self.keras_lock = threading.Lock()
+        self.keras_model(WARMUP_SEQUENCE, training=False)
+        self.tflite_interpreter = None
+        self.tflite_input_details = None
+        self.tflite_output_details = None
+        self.tflite_lock = threading.Lock()
+        self.engine_name = "keras"
+
+        if os.path.exists(tflite_model_path):
+            try:
+                self._load_tflite(tflite_model_path)
+                if self._validate_tflite(validation_dataset_path):
+                    self.engine_name = "tflite"
+                else:
+                    self._disable_tflite("validation mismatch")
+            except Exception as exc:
+                self._disable_tflite(str(exc))
+
+        print(f"Inference engine: {self.engine_name}")
+
+    def _load_tflite(self, tflite_model_path):
+        interpreter = tf.lite.Interpreter(model_path=tflite_model_path, num_threads=max(1, os.cpu_count() or 1))
+        interpreter.allocate_tensors()
+        input_details = interpreter.get_input_details()[0]
+        output_details = interpreter.get_output_details()[0]
+        interpreter.set_tensor(input_details["index"], WARMUP_SEQUENCE.astype(input_details["dtype"], copy=False))
+        interpreter.invoke()
+
+        self.tflite_interpreter = interpreter
+        self.tflite_input_details = input_details
+        self.tflite_output_details = output_details
+
+    def _disable_tflite(self, reason):
+        print(f"TFLite disabled: {reason}")
+        self.tflite_interpreter = None
+        self.tflite_input_details = None
+        self.tflite_output_details = None
+
+    def _load_validation_sequences(self, validation_dataset_path):
+        sequences = [WARMUP_SEQUENCE[0]]
+
+        if not os.path.exists(validation_dataset_path):
+            return sequences
+
+        try:
+            data = np.load(validation_dataset_path)
+            samples = data["X"][:TFLITE_VALIDATION_SAMPLE_LIMIT]
+            for sample in samples:
+                sequences.append(sample.astype(np.float32, copy=False))
+        except Exception as exc:
+            print(f"TFLite validation samples unavailable: {exc}")
+
+        return sequences
+
+    def _validate_tflite(self, validation_dataset_path):
+        if self.tflite_interpreter is None:
+            return False
+
+        for sequence in self._load_validation_sequences(validation_dataset_path):
+            keras_probs = self._predict_with_keras(sequence)
+            tflite_probs = self._predict_with_tflite(sequence)
+
+            keras_idx = int(np.argmax(keras_probs))
+            tflite_idx = int(np.argmax(tflite_probs))
+            keras_conf = float(keras_probs[keras_idx])
+            tflite_conf = float(tflite_probs[tflite_idx])
+
+            if keras_idx != tflite_idx:
+                print(f"TFLite validation failed: argmax mismatch {keras_idx} vs {tflite_idx}")
+                return False
+
+            if abs(keras_conf - tflite_conf) > TFLITE_CONFIDENCE_DELTA_TOLERANCE:
+                print(
+                    "TFLite validation failed: confidence drift "
+                    f"{keras_conf:.4f} vs {tflite_conf:.4f}"
+                )
+                return False
+
+        return True
+
+    def _predict_with_keras(self, sequence):
+        batch = np.expand_dims(sequence.astype(np.float32, copy=False), axis=0)
+        with self.keras_lock:
+            return self.keras_model(batch, training=False).numpy()[0]
+
+    def _predict_with_tflite(self, sequence):
+        batch = np.expand_dims(sequence.astype(np.float32, copy=False), axis=0)
+        with self.tflite_lock:
+            self.tflite_interpreter.set_tensor(
+                self.tflite_input_details["index"],
+                batch.astype(self.tflite_input_details["dtype"], copy=False),
+            )
+            self.tflite_interpreter.invoke()
+            return self.tflite_interpreter.get_tensor(self.tflite_output_details["index"])[0]
+
+    def predict(self, sequence):
+        if self.engine_name == "tflite" and self.tflite_interpreter is not None:
+            return self._predict_with_tflite(sequence)
+        return self._predict_with_keras(sequence)
+
+
+prediction_engine = PredictionEngine(MODEL_PATH, TFLITE_MODEL_PATH, DATASET_SAMPLES_PATH)
 
 # ============================================================================
 # 🧠 SMART MATCHING ALGORITHM
@@ -195,6 +314,17 @@ def normalize_frame(pose, lh, rh, anchors):
         return reshaped.flatten()
     return np.concatenate([norm(pose), norm(lh), norm(rh)])
 
+
+def get_prediction_stride(video_fps):
+    if video_fps and video_fps >= HIGH_FPS_THRESHOLD:
+        return HIGH_FPS_PREDICTION_STRIDE
+    return LOW_FPS_PREDICTION_STRIDE
+
+
+def get_trailing_no_hand_break_frames(video_fps):
+    fps = video_fps if video_fps and video_fps > 0 else HIGH_FPS_THRESHOLD
+    return max(8, int(round(fps * TRAILING_NO_HAND_SECONDS)))
+
 # ============================================================================
 # VIDEO PROCESSING
 # ============================================================================
@@ -202,9 +332,15 @@ def process_video(video_path):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened(): return ""
 
+    video_fps = cap.get(cv2.CAP_PROP_FPS)
+    prediction_stride = get_prediction_stride(video_fps)
+    trailing_no_hand_break_frames = get_trailing_no_hand_break_frames(video_fps)
+
     holistic = mp_holistic.Holistic(static_image_mode=False, min_detection_confidence=0.5, min_tracking_confidence=0.5)
     frame_buffer = deque(maxlen=SEQUENCE_LENGTH)
     prediction_history = []
+    frame_index = 0
+    trailing_no_hand_frames = 0
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -217,19 +353,31 @@ def process_video(video_path):
         p, l, r, a = extract_features(results)
         norm = normalize_frame(p, l, r, a)
         
-        if norm is not None: frame_buffer.append(norm)
-        else: frame_buffer.append(np.zeros(144))
+        if norm is not None: frame_buffer.append(norm.astype(np.float32, copy=False))
+        else: frame_buffer.append(ZERO_FRAME)
+
+        if hands_visible:
+            trailing_no_hand_frames = 0
+        elif prediction_history:
+            trailing_no_hand_frames += 1
+            if trailing_no_hand_frames >= trailing_no_hand_break_frames:
+                break
         
-        if len(frame_buffer) == SEQUENCE_LENGTH and hands_visible:
-            sequence = np.array(list(frame_buffer))
-            inp = np.expand_dims(sequence, axis=0)
-            probs = model.predict(inp, verbose=0)[0]
+        if (
+            len(frame_buffer) == SEQUENCE_LENGTH
+            and hands_visible
+            and frame_index % prediction_stride == 0
+        ):
+            sequence = np.stack(frame_buffer, axis=0)
+            probs = prediction_engine.predict(sequence)
             idx = np.argmax(probs)
             conf = float(probs[idx])
             pred = class_names[idx]
             
             if pred != "_idle_" and conf >= CONFIDENCE_THRESHOLD:
                 prediction_history.append(pred)
+
+        frame_index += 1
 
     cap.release()
     holistic.close()
@@ -262,7 +410,9 @@ def predict_sentence():
     temp_path = os.path.join(temp_dir, "received_video.mp4")
     video_file.save(temp_path)
 
+    start_time = time.perf_counter()
     sentence = process_video(temp_path)
+    duration_ms = round((time.perf_counter() - start_time) * 1000, 1)
 
     try:
         os.remove(temp_path)
@@ -270,13 +420,18 @@ def predict_sentence():
     except: pass
 
     if sentence:
-        return jsonify({"sentence": sentence})
+        return jsonify({"sentence": sentence, "latency_ms": duration_ms, "engine": prediction_engine.engine_name})
     else:
-        return jsonify({"sentence": "", "error": "No signs detected"})
+        return jsonify({
+            "sentence": "",
+            "error": "No signs detected",
+            "latency_ms": duration_ms,
+            "engine": prediction_engine.engine_name,
+        })
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "engine": prediction_engine.engine_name})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
