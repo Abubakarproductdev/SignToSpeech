@@ -1,5 +1,0 @@
-psl_model_v3.h5
-psl_model_v3.tflite
-dataset/
-data_keypoints_v3/
-preprocessed_dataset_v3.npz
