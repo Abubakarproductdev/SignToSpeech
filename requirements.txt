@@ -1,7 +1,7 @@
-flask
-flask-cors
+Flask
+Flask-Cors
 numpy
-opencv-python
+opencv-python-headless
 mediapipe
 tensorflow
 gunicorn
