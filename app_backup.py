@@ -205,13 +205,10 @@ def process_video(video_path):
     holistic = mp_holistic.Holistic(static_image_mode=False, min_detection_confidence=0.5, min_tracking_confidence=0.5)
     frame_buffer = deque(maxlen=SEQUENCE_LENGTH)
     prediction_history = []
-    frame_count = 0
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret: break
-        
-        frame_count += 1
         
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = holistic.process(rgb)
@@ -224,20 +221,15 @@ def process_video(video_path):
         else: frame_buffer.append(np.zeros(144))
         
         if len(frame_buffer) == SEQUENCE_LENGTH and hands_visible:
-            # STRIDE: Predict every 5th frame instead of every frame
-            if frame_count % 5 == 0:
-                sequence = np.array(list(frame_buffer))
-                inp = np.expand_dims(sequence, axis=0)
-                
-                # HUGE SPEEDUP: Use model(inp) instead of model.predict(inp)
-                probs = model(inp, training=False).numpy()[0]
-                
-                idx = np.argmax(probs)
-                conf = float(probs[idx])
-                pred = class_names[idx]
-                
-                if pred != "_idle_" and conf >= CONFIDENCE_THRESHOLD:
-                    prediction_history.append(pred)
+            sequence = np.array(list(frame_buffer))
+            inp = np.expand_dims(sequence, axis=0)
+            probs = model.predict(inp, verbose=0)[0]
+            idx = np.argmax(probs)
+            conf = float(probs[idx])
+            pred = class_names[idx]
+            
+            if pred != "_idle_" and conf >= CONFIDENCE_THRESHOLD:
+                prediction_history.append(pred)
 
     cap.release()
     holistic.close()
