@@ -213,10 +213,6 @@ def process_video(video_path):
         
         frame_count += 1
         
-        # Skip 4 out of 5 frames to drastically reduce MediaPipe CPU load
-        if frame_count % 5 != 0:
-            continue
-        
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = holistic.process(rgb)
         
@@ -228,18 +224,20 @@ def process_video(video_path):
         else: frame_buffer.append(np.zeros(144))
         
         if len(frame_buffer) == SEQUENCE_LENGTH and hands_visible:
-            sequence = np.array(list(frame_buffer))
-            inp = np.expand_dims(sequence, axis=0)
-            
-            # HUGE SPEEDUP: Use model(inp) instead of model.predict(inp)
-            probs = model(inp, training=False).numpy()[0]
-            
-            idx = np.argmax(probs)
-            conf = float(probs[idx])
-            pred = class_names[idx]
-            
-            if pred != "_idle_" and conf >= CONFIDENCE_THRESHOLD:
-                prediction_history.append(pred)
+            # STRIDE: Predict every 5th frame instead of every frame
+            if frame_count % 5 == 0:
+                sequence = np.array(list(frame_buffer))
+                inp = np.expand_dims(sequence, axis=0)
+                
+                # HUGE SPEEDUP: Use model(inp) instead of model.predict(inp)
+                probs = model(inp, training=False).numpy()[0]
+                
+                idx = np.argmax(probs)
+                conf = float(probs[idx])
+                pred = class_names[idx]
+                
+                if pred != "_idle_" and conf >= CONFIDENCE_THRESHOLD:
+                    prediction_history.append(pred)
 
     cap.release()
     holistic.close()
