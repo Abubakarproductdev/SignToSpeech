@@ -20,7 +20,6 @@ import os
 import tempfile
 from collections import deque
 import re
-import time
 
 app = Flask(__name__)
 CORS(app) # Enable CORS for mobile access
@@ -102,23 +101,6 @@ with open(CLASS_FILE, "r") as f:
     class_names = json.load(f)
 
 mp_holistic = mp.solutions.holistic
-
-# ============================================================================
-# BUILD DETECTOR ONCE AT STARTUP (reused across all requests)
-# ============================================================================
-holistic_detector = mp_holistic.Holistic(
-    static_image_mode=False,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
-print("\u2705 MediaPipe Holistic detector built once at startup.")
-
-# ============================================================================
-# WARM UP KERAS MODEL (avoid first-call graph tracing during real requests)
-# ============================================================================
-_dummy_input = np.zeros((1, SEQUENCE_LENGTH, 144), dtype=np.float32)
-_ = model(_dummy_input, training=False)
-print("\u2705 Keras model warmed up with dummy forward pass.")
 
 # ============================================================================
 # 🧠 SMART MATCHING ALGORITHM
@@ -217,19 +199,13 @@ def normalize_frame(pose, lh, rh, anchors):
 # VIDEO PROCESSING
 # ============================================================================
 def process_video(video_path):
-    total_start = time.time()
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened(): return ""
 
-    # Reuse the global holistic detector (no graph rebuild cost)
-    global holistic_detector
+    holistic = mp_holistic.Holistic(static_image_mode=False, min_detection_confidence=0.5, min_tracking_confidence=0.5)
     frame_buffer = deque(maxlen=SEQUENCE_LENGTH)
     prediction_history = []
     frame_count = 0
-    mediapipe_time = 0
-    prediction_time = 0
-    last_results = None
-    mp_calls = 0
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -238,17 +214,7 @@ def process_video(video_path):
         frame_count += 1
         
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # STEP 1: Process every 2nd frame, reuse landmarks for skipped frames
-        # At 30fps, hand positions barely change between consecutive frames
-        if frame_count % 2 == 1 or last_results is None:
-            mp_start = time.time()
-            results = holistic_detector.process(rgb)
-            mediapipe_time += time.time() - mp_start
-            last_results = results
-            mp_calls += 1
-        else:
-            results = last_results  # Reuse previous frame's landmarks
+        results = holistic.process(rgb)
         
         hands_visible = (results.left_hand_landmarks or results.right_hand_landmarks)
         p, l, r, a = extract_features(results)
@@ -258,15 +224,13 @@ def process_video(video_path):
         else: frame_buffer.append(np.zeros(144))
         
         if len(frame_buffer) == SEQUENCE_LENGTH and hands_visible:
-            # STEP 2: Predict every 10th frame instead of every 5th
-            if frame_count % 10 == 0:
+            # STRIDE: Predict every 5th frame instead of every frame
+            if frame_count % 5 == 0:
                 sequence = np.array(list(frame_buffer))
                 inp = np.expand_dims(sequence, axis=0)
                 
-                pred_start = time.time()
                 # HUGE SPEEDUP: Use model(inp) instead of model.predict(inp)
                 probs = model(inp, training=False).numpy()[0]
-                prediction_time += time.time() - pred_start
                 
                 idx = np.argmax(probs)
                 conf = float(probs[idx])
@@ -276,11 +240,7 @@ def process_video(video_path):
                     prediction_history.append(pred)
 
     cap.release()
-
-    print(f"\u23f1\ufe0f [Profiler] Total frames: {frame_count} | MediaPipe calls: {mp_calls}")
-    print(f"\u23f1\ufe0f [Profiler] MediaPipe time: {mediapipe_time:.2f}s")
-    print(f"\u23f1\ufe0f [Profiler] Prediction time: {prediction_time:.2f}s")
-    print(f"\u23f1\ufe0f [Profiler] Total processing: {time.time() - total_start:.2f}s")
+    holistic.close()
 
     if not prediction_history: return ""
 
@@ -302,17 +262,13 @@ def process_video(video_path):
 # ============================================================================
 @app.route("/predict_sentence", methods=["POST"])
 def predict_sentence():
-    request_start = time.time()
     if "video" not in request.files:
         return jsonify({"error": "No video file received"}), 400
 
     video_file = request.files["video"]
     temp_dir = tempfile.mkdtemp()
     temp_path = os.path.join(temp_dir, "received_video.mp4")
-    
-    save_start = time.time()
     video_file.save(temp_path)
-    print(f"\u23f1\ufe0f [Profiler] File save to disk: {time.time() - save_start:.2f}s")
 
     sentence = process_video(temp_path)
 
@@ -320,8 +276,6 @@ def predict_sentence():
         os.remove(temp_path)
         os.rmdir(temp_dir)
     except: pass
-
-    print(f"\u23f1\ufe0f [Profiler] Total request time: {time.time() - request_start:.2f}s")
 
     if sentence:
         return jsonify({"sentence": sentence})

@@ -228,8 +228,6 @@ def process_video(video_path):
     frame_count = 0
     mediapipe_time = 0
     prediction_time = 0
-    last_results = None
-    mp_calls = 0
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -239,16 +237,9 @@ def process_video(video_path):
         
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # STEP 1: Process every 2nd frame, reuse landmarks for skipped frames
-        # At 30fps, hand positions barely change between consecutive frames
-        if frame_count % 2 == 1 or last_results is None:
-            mp_start = time.time()
-            results = holistic_detector.process(rgb)
-            mediapipe_time += time.time() - mp_start
-            last_results = results
-            mp_calls += 1
-        else:
-            results = last_results  # Reuse previous frame's landmarks
+        mp_start = time.time()
+        results = holistic_detector.process(rgb)
+        mediapipe_time += time.time() - mp_start
         
         hands_visible = (results.left_hand_landmarks or results.right_hand_landmarks)
         p, l, r, a = extract_features(results)
@@ -258,8 +249,8 @@ def process_video(video_path):
         else: frame_buffer.append(np.zeros(144))
         
         if len(frame_buffer) == SEQUENCE_LENGTH and hands_visible:
-            # STEP 2: Predict every 10th frame instead of every 5th
-            if frame_count % 10 == 0:
+            # STRIDE: Predict every 5th frame instead of every frame
+            if frame_count % 5 == 0:
                 sequence = np.array(list(frame_buffer))
                 inp = np.expand_dims(sequence, axis=0)
                 
@@ -277,7 +268,7 @@ def process_video(video_path):
 
     cap.release()
 
-    print(f"\u23f1\ufe0f [Profiler] Total frames: {frame_count} | MediaPipe calls: {mp_calls}")
+    print(f"\u23f1\ufe0f [Profiler] Total frames: {frame_count}")
     print(f"\u23f1\ufe0f [Profiler] MediaPipe time: {mediapipe_time:.2f}s")
     print(f"\u23f1\ufe0f [Profiler] Prediction time: {prediction_time:.2f}s")
     print(f"\u23f1\ufe0f [Profiler] Total processing: {time.time() - total_start:.2f}s")
