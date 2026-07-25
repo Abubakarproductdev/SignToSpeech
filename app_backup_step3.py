@@ -108,7 +108,6 @@ mp_holistic = mp.solutions.holistic
 # ============================================================================
 holistic_detector = mp_holistic.Holistic(
     static_image_mode=False,
-    model_complexity=0,
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5
 )
@@ -240,9 +239,9 @@ def process_video(video_path):
         
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # STEP 1+3: Process every 3rd frame, reuse landmarks for skipped frames
-        # At 30fps, hand positions barely change across 2-3 consecutive frames
-        if frame_count % 3 == 1 or last_results is None:
+        # STEP 1: Process every 2nd frame, reuse landmarks for skipped frames
+        # At 30fps, hand positions barely change between consecutive frames
+        if frame_count % 2 == 1 or last_results is None:
             mp_start = time.time()
             results = holistic_detector.process(rgb)
             mediapipe_time += time.time() - mp_start
