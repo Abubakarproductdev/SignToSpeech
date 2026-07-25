@@ -20,7 +20,6 @@ import os
 import tempfile
 from collections import deque
 import re
-import time
 
 app = Flask(__name__)
 CORS(app) # Enable CORS for mobile access
@@ -200,17 +199,13 @@ def normalize_frame(pose, lh, rh, anchors):
 # VIDEO PROCESSING
 # ============================================================================
 def process_video(video_path):
-    total_start = time.time()
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened(): return ""
 
-    # OPTIMIZATION: model_complexity=0 uses the lite model (~2x faster)
-    holistic = mp_holistic.Holistic(static_image_mode=False, model_complexity=0, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+    holistic = mp_holistic.Holistic(static_image_mode=False, min_detection_confidence=0.5, min_tracking_confidence=0.5)
     frame_buffer = deque(maxlen=SEQUENCE_LENGTH)
     prediction_history = []
     frame_count = 0
-    mediapipe_time = 0
-    prediction_time = 0
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -218,13 +213,8 @@ def process_video(video_path):
         
         frame_count += 1
         
-        # OPTIMIZATION: Downscale frame to 320x240 before MediaPipe
-        frame_small = cv2.resize(frame, (320, 240))
-        rgb = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
-        
-        mp_start = time.time()
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = holistic.process(rgb)
-        mediapipe_time += time.time() - mp_start
         
         hands_visible = (results.left_hand_landmarks or results.right_hand_landmarks)
         p, l, r, a = extract_features(results)
@@ -239,10 +229,8 @@ def process_video(video_path):
                 sequence = np.array(list(frame_buffer))
                 inp = np.expand_dims(sequence, axis=0)
                 
-                pred_start = time.time()
                 # HUGE SPEEDUP: Use model(inp) instead of model.predict(inp)
                 probs = model(inp, training=False).numpy()[0]
-                prediction_time += time.time() - pred_start
                 
                 idx = np.argmax(probs)
                 conf = float(probs[idx])
@@ -253,12 +241,6 @@ def process_video(video_path):
 
     cap.release()
     holistic.close()
-
-    total_elapsed = time.time() - total_start
-    print(f"⏱️ [Profiler] Total frames: {frame_count}")
-    print(f"⏱️ [Profiler] MediaPipe time: {mediapipe_time:.2f}s")
-    print(f"⏱️ [Profiler] Prediction time: {prediction_time:.2f}s")
-    print(f"⏱️ [Profiler] Total processing: {total_elapsed:.2f}s")
 
     if not prediction_history: return ""
 
@@ -306,4 +288,4 @@ def health():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    app.run(host="0.0.0.0", port=port)
